@@ -14,7 +14,10 @@
 6. [工具系统](#6-工具系统)
 7. [上下文压缩](#7-上下文压缩)
 8. [完整数据流](#8-完整数据流)
-9. [关键设计决策](#9-关键设计决策)
+9. [用户交互流程](#9-用户交互流程)
+10. [媒体理解](#10-媒体理解)
+11. [模型 API 接口](#11-模型-api-接口)
+12. [关键设计决策](#12-关键设计决策)
 
 ---
 
@@ -399,7 +402,169 @@ chokidar 检测变化 → dirty 标志
 
 ---
 
-## 9. 关键设计决策
+## 9. 用户交互流程
+
+### 10.1 多层架构
+
+```
+用户层（各平台客户端）
+        │
+        ↓
+渠道适配层（telegram/bot.ts, discord/bot.ts, ...）
+  - 接收原始消息
+  - 下载媒体文件
+  - 构建 MsgContext
+        │
+        ↓
+Gateway 网关层
+  - 路由决策（哪个 Agent 处理）
+  - 权限检查（allowFrom、群组策略）
+  - 会话管理（SessionKey 生成）
+        │
+        ↓
+Auto-Reply 处理层
+  - 媒体理解（图片/音频/视频转文字）
+  - 链接理解（URL 抓取摘要）
+  - 指令解析（/model、/reset）
+  - 触发 Agent 执行
+        │
+        ↓
+Agent 执行层
+  - 工具调用
+  - 流式输出
+        │
+        ↓
+Reply Dispatcher 回复分发层
+  - 工具结果回复 (tool)
+  - 块级回复 (block)
+  - 最终回复 (final)
+        │
+        ↓
+渠道投递层
+  - 消息分块
+  - 格式转换
+  - 媒体上传
+```
+
+### 10.2 消息上下文（MsgContext）
+
+每条入站消息被封装为统一的 `MsgContext` 对象：
+
+| 字段 | 说明 |
+|------|------|
+| `Body` | 原始消息体 |
+| `BodyForAgent` | 给 Agent 的格式化消息（含历史上下文） |
+| `From` / `SenderName` | 发送者信息 |
+| `SessionKey` | 会话路由键 |
+| `Provider` | 渠道类型（telegram/discord/...） |
+| `ChatType` | 对话类型（private/group） |
+| `WasMentioned` | 是否被 @ |
+| `MediaPath` / `MediaType` | 媒体文件信息 |
+| `MediaUnderstanding` | 媒体理解结果 |
+
+### 9.3 Reply Dispatcher
+
+回复分发器串行化投递，支持三种回复类型：
+
+```typescript
+const dispatcher = createReplyDispatcher({
+    deliver: async (payload, { kind }) => {
+        // kind: "tool" | "block" | "final"
+        await sendToChannel(payload);
+    },
+    humanDelay: { mode: "default" },  // 可选人类延迟
+});
+
+// Agent 执行过程中调用
+dispatcher.sendToolResult({ body: "文件已创建" });
+dispatcher.sendBlockReply({ body: "正在处理..." });
+dispatcher.sendFinalReply({ body: "完成！" });
+```
+
+---
+
+## 10. 媒体理解
+
+### 10.1 三种能力
+
+| 能力 | 输出类型 | 用途 |
+|------|----------|------|
+| `image` | `image.description` | 图片内容描述 |
+| `audio` | `audio.transcription` | 音频转文字 |
+| `video` | `video.description` | 视频内容描述 |
+
+### 10.2 两种处理模式
+
+**Provider 模式（调用 API）**：
+
+| Provider | 图片 | 音频 | 视频 |
+|----------|------|------|------|
+| OpenAI | ✅ gpt-5-mini | ✅ whisper-1 | ❌ |
+| Anthropic | ✅ claude-opus-4-5 | ❌ | ❌ |
+| Google | ✅ gemini-3-flash | ✅ | ✅ |
+| DeepGram | ❌ | ✅ | ❌ |
+| Groq | ❌ | ✅ whisper-large-v3 | ❌ |
+
+**CLI 模式（本地命令）**：
+
+| 工具 | 用途 |
+|------|------|
+| `whisper` | OpenAI Whisper 本地版 |
+| `whisper-cli` | whisper.cpp |
+| `sherpa-onnx-offline` | 离线语音识别 |
+| `gemini` | Gemini CLI |
+
+### 10.3 自动 Provider 选择
+
+```
+1. 优先使用当前对话的模型（如果支持该能力）
+2. 音频：优先本地工具（whisper/sherpa-onnx）
+3. 检查 Gemini CLI
+4. 按优先级检查 API Key（openai → anthropic → google → ...）
+```
+
+### 10.4 智能跳过
+
+当主模型本身支持视觉能力时（如 GPT-4o），跳过图片预处理，直接把图片发给模型。
+
+---
+
+## 11. 模型 API 接口
+
+### 11.1 支持的 API 类型
+
+| API 类型 | 对应 Provider | 说明 |
+|----------|--------------|------|
+| `anthropic-messages` | Anthropic (Claude) | Anthropic Messages API |
+| `openai-completions` | OpenAI, 兼容服务 | OpenAI Chat Completions API |
+| `openai-responses` | OpenAI o1/o3 | OpenAI Responses API (推理模型) |
+| `google-generative-ai` | Google Gemini | Google Generative AI SDK |
+| `bedrock-converse-stream` | AWS Bedrock | AWS Bedrock Converse API |
+
+### 11.2 OpenAI 兼容服务
+
+使用 `openai-completions` API 的第三方服务：
+
+- MiniMax (`https://api.minimax.chat/v1`)
+- Moonshot/Kimi (`https://api.moonshot.ai/v1`)
+- Qwen Portal (`https://portal.qwen.ai/v1`)
+- Ollama (`http://127.0.0.1:11434/v1`)
+- Venice, OpenRouter, GitHub Copilot
+
+### 11.3 历史适配（TranscriptPolicy）
+
+不同 API 对消息格式有不同要求：
+
+| 策略 | OpenAI | Anthropic | Google |
+|------|--------|-----------|--------|
+| `sanitizeToolCallIds` | ❌ | ❌ | ✅ |
+| `repairToolUseResultPairing` | ❌ | ✅ | ✅ |
+| `validateTurns` | ❌ | ✅ | ✅ |
+| `applyGoogleTurnOrdering` | ❌ | ❌ | ✅ |
+
+---
+
+## 12. 关键设计决策
 
 ### 9.1 为什么用 JSONL 而不是数据库？
 
